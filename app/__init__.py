@@ -1,0 +1,120 @@
+from flask import Flask, request
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager
+from flask_wtf.csrf import CSRFProtect
+from pathlib import Path
+
+db = SQLAlchemy()
+login_manager = LoginManager()
+csrf = CSRFProtect()
+login_manager.login_view = "admin.login"
+
+
+def request_is_https():
+    return request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object("config.Config")
+    app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
+    app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
+    app.config.setdefault("WTF_CSRF_TIME_LIMIT", 3600)
+    csrf.init_app(app)
+
+    @app.after_request
+    def add_security_headers(response):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "geolocation=(self), camera=(), microphone=()")
+        if request_is_https():
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+    Path(app.instance_path).mkdir(parents=True, exist_ok=True)
+
+    db.init_app(app)
+    login_manager.init_app(app)
+
+    app.jinja_env.filters["fromjson"] = lambda v: __import__("json").loads(v)
+
+    from .routes import main, admin
+    app.register_blueprint(main)
+    app.register_blueprint(admin, url_prefix="/owner")
+
+    with app.app_context():
+        from .models import Product, Admin, Animal, Vaccination
+
+        db.create_all()
+        seed()
+
+    return app
+
+
+def seed():
+    from .models import Product, Admin
+    from werkzeug.security import generate_password_hash
+    import os
+
+    # Create products if database is empty
+    if not Product.query.first():
+        data = [
+            ("Cow Milk", "cow-milk", 80, "liter", "Dairy", "Fresh local cow milk.", "🥛"),
+            ("Buffalo Milk", "buffalo-milk", 90, "liter", "Dairy", "Rich and creamy buffalo milk.", "🥛"),
+            ("Dahi", "dahi", 120, "kg", "Dairy", "Fresh traditional yogurt.", "🥣"),
+            ("Mahi", "mahi", 70, "liter", "Dairy", "Refreshing traditional dairy drink.", "🥤"),
+            ("Paneer", "paneer", 700, "kg", "Dairy", "Fresh paneer made from quality milk.", "🧀"),
+            ("Ghee", "ghee", 1000, "kg", "Dairy", "Rich dairy ghee.", "🫙"),
+            ("Cow", "cow", None, "on request", "Livestock",
+             "Healthy cows. Ask about breed, age, availability and price.", "🐄"),
+            ("Buffalo", "buffalo", None, "on request", "Livestock",
+             "Buffalo available based on current stock.", "🐃"),
+            ("Calf", "calf", None, "on request", "Livestock",
+             "Calves available based on current stock.", "🐮")
+        ]
+
+        db.session.add_all([
+            Product(
+                name=a,
+                slug=b,
+                price=c,
+                unit=d,
+                category=e,
+                description=f,
+                icon=g
+            )
+            for a, b, c, d, e, f, g in data
+        ])
+
+        db.session.commit()
+
+    # Always get the owner AFTER the database has been initialized
+    owner = Admin.query.filter_by(username="owner").first()
+
+    # Temporary password reset
+    reset_password = os.environ.get("RESET_OWNER_PASSWORD")
+
+    if reset_password and len(reset_password) >= 10:
+        if owner:
+            owner.password_hash = generate_password_hash(reset_password)
+        else:
+            owner = Admin(
+                username="owner",
+                password_hash=generate_password_hash(reset_password)
+            )
+            db.session.add(owner)
+
+        db.session.commit()
+
+    # Create owner on first deployment
+    elif not owner:
+        password = os.environ.get("INITIAL_OWNER_PASSWORD")
+
+        if password and len(password) >= 10:
+            owner = Admin(
+                username="owner",
+                password_hash=generate_password_hash(password)
+            )
+            db.session.add(owner)
+            db.session.commit()
